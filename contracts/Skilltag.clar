@@ -12,6 +12,11 @@
 (define-constant err-invalid-skill-level (err u107))
 (define-constant err-skill-already-exists (err u108))
 (define-constant err-unauthorized-issuer (err u109))
+(define-constant err-cannot-endorse-self (err u110))
+(define-constant err-already-endorsed (err u111))
+(define-constant err-endorsement-not-found (err u112))
+(define-constant err-endorsement-expired (err u113))
+(define-constant err-insufficient-reputation (err u114))
 
 (define-data-var last-token-id uint u0)
 (define-data-var commission uint u250)
@@ -34,6 +39,14 @@
 (define-map authorized-issuers principal bool)
 
 (define-map user-skills principal (list 50 (string-ascii 50)))
+
+(define-map skill-endorsements (tuple (skill-name (string-ascii 50)) (skill-holder principal)) 
+  (tuple (endorsement-count uint) (total-reputation uint)))
+
+(define-map user-endorsements (tuple (endorser principal) (skill-name (string-ascii 50)) (skill-holder principal))
+  (tuple (reputation-weight uint) (endorsed-at uint) (expiry-block uint)))
+
+(define-map user-reputation principal uint)
 
 (define-read-only (get-last-token-id)
   (ok (var-get last-token-id)))
@@ -60,6 +73,28 @@
 
 (define-read-only (is-authorized-issuer (issuer principal))
   (default-to false (map-get? authorized-issuers issuer)))
+
+(define-read-only (get-skill-endorsements (skill-name (string-ascii 50)) (skill-holder principal))
+  (default-to (tuple (endorsement-count u0) (total-reputation u0)) 
+    (map-get? skill-endorsements (tuple (skill-name skill-name) (skill-holder skill-holder)))))
+
+(define-read-only (get-user-endorsement (endorser principal) (skill-name (string-ascii 50)) (skill-holder principal))
+  (map-get? user-endorsements (tuple (endorser endorser) (skill-name skill-name) (skill-holder skill-holder))))
+
+(define-read-only (get-user-reputation (user principal))
+  (default-to u0 (map-get? user-reputation user)))
+
+(define-read-only (calculate-reputation-weight (endorser principal))
+  (let ((base-reputation (get-user-reputation endorser))
+        (skill-count (len (get-user-skills endorser))))
+    (if (> skill-count u0)
+      (+ u1 (/ base-reputation u10) (/ skill-count u5))
+      u1)))
+
+(define-read-only (has-valid-endorsement (endorser principal) (skill-name (string-ascii 50)) (skill-holder principal))
+  (match (get-user-endorsement endorser skill-name skill-holder)
+    endorsement (< stacks-block-height (get expiry-block endorsement))
+    false))
 
 (define-public (authorize-issuer (issuer principal))
   (begin
@@ -173,19 +208,79 @@
   (let ((skilltag-info (unwrap! (get-skilltag-data token-id) err-nft-not-found)))
     (ok (< stacks-block-height (get expiry-block skilltag-info)))))
 
-;; (define-read-only (get-skills-by-level (user principal) (level (string-ascii 20)))
-;;   (let ((all-skills (get-user-skills user)))
-;;     (filter (lambda (skill) (has-skill-level user skill level)) all-skills)))
+(define-public (endorse-skill (skill-name (string-ascii 50)) (skill-holder principal) (validity-blocks uint))
+  (let ((endorser tx-sender)
+        (reputation-weight (calculate-reputation-weight tx-sender))
+        (current-endorsement (get-skill-endorsements skill-name skill-holder))
+        (endorsement-key (tuple (endorser endorser) (skill-name skill-name) (skill-holder skill-holder)))
+        (skill-key (tuple (skill-name skill-name) (skill-holder skill-holder)))
+        (expiry-block (+ stacks-block-height validity-blocks)))
+    (asserts! (not (is-eq endorser skill-holder)) err-cannot-endorse-self)
+    (asserts! (is-some (index-of (get-user-skills skill-holder) skill-name)) (err u0))
+    (asserts! (not (has-valid-endorsement endorser skill-name skill-holder)) err-already-endorsed)
+    (asserts! (>= reputation-weight u1) err-insufficient-reputation)
+    (map-set user-endorsements endorsement-key 
+      (tuple (reputation-weight reputation-weight) (endorsed-at stacks-block-height) (expiry-block expiry-block)))
+    (map-set skill-endorsements skill-key
+      (tuple 
+        (endorsement-count (+ (get endorsement-count current-endorsement) u1))
+        (total-reputation (+ (get total-reputation current-endorsement) reputation-weight))))
+    (map-set user-reputation skill-holder (+ (get-user-reputation skill-holder) reputation-weight))
+    (ok true)))
 
-;; (define-private (has-skill-level (user principal) (skill-name (string-ascii 50)) (target-level (string-ascii 20)))
-;;   (let ((user-tokens (get-user-token-ids user)))
-;;     (is-some (find (lambda (token-id) 
-;;       (match (get-skilltag-data token-id)
-;;         token-data (and 
-;;           (is-eq (get skill-name token-data) skill-name)
-;;           (is-eq (get skill-level token-data) target-level))
-;;         false)) user-tokens))))
+(define-public (revoke-endorsement (skill-name (string-ascii 50)) (skill-holder principal))
+  (let ((endorser tx-sender)
+        (endorsement-key (tuple (endorser endorser) (skill-name skill-name) (skill-holder skill-holder)))
+        (skill-key (tuple (skill-name skill-name) (skill-holder skill-holder)))
+        (existing-endorsement (unwrap! (get-user-endorsement endorser skill-name skill-holder) err-endorsement-not-found))
+        (current-skill-endorsement (get-skill-endorsements skill-name skill-holder))
+        (reputation-weight (get reputation-weight existing-endorsement)))
+    (asserts! (has-valid-endorsement endorser skill-name skill-holder) err-endorsement-expired)
+    (map-delete user-endorsements endorsement-key)
+    (map-set skill-endorsements skill-key
+      (tuple 
+        (endorsement-count (- (get endorsement-count current-skill-endorsement) u1))
+        (total-reputation (- (get total-reputation current-skill-endorsement) reputation-weight))))
+    (map-set user-reputation skill-holder (- (get-user-reputation skill-holder) reputation-weight))
+    (ok true)))
 
-;; (define-private (get-user-token-ids (user principal))
-;;   (let ((balance (get-balance user)))
-;;     (map (lambda (i) (+ i u1)) (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9))))
+(define-public (refresh-endorsement (skill-name (string-ascii 50)) (skill-holder principal) (new-validity-blocks uint))
+  (let ((endorser tx-sender)
+        (endorsement-key (tuple (endorser endorser) (skill-name skill-name) (skill-holder skill-holder)))
+        (existing-endorsement (unwrap! (get-user-endorsement endorser skill-name skill-holder) err-endorsement-not-found))
+        (new-expiry-block (+ stacks-block-height new-validity-blocks)))
+    (asserts! (has-valid-endorsement endorser skill-name skill-holder) err-endorsement-expired)
+    (map-set user-endorsements endorsement-key
+      (tuple 
+        (reputation-weight (get reputation-weight existing-endorsement))
+        (endorsed-at (get endorsed-at existing-endorsement))
+        (expiry-block new-expiry-block)))
+    (ok true)))
+
+(define-public (cleanup-expired-endorsement (endorser principal) (skill-name (string-ascii 50)) (skill-holder principal))
+  (let ((endorsement-key (tuple (endorser endorser) (skill-name skill-name) (skill-holder skill-holder)))
+        (skill-key (tuple (skill-name skill-name) (skill-holder skill-holder)))
+        (existing-endorsement (unwrap! (get-user-endorsement endorser skill-name skill-holder) err-endorsement-not-found))
+        (current-skill-endorsement (get-skill-endorsements skill-name skill-holder))
+        (reputation-weight (get reputation-weight existing-endorsement)))
+    (asserts! (>= stacks-block-height (get expiry-block existing-endorsement)) err-endorsement-not-found)
+    (map-delete user-endorsements endorsement-key)
+    (map-set skill-endorsements skill-key
+      (tuple 
+        (endorsement-count (- (get endorsement-count current-skill-endorsement) u1))
+        (total-reputation (- (get total-reputation current-skill-endorsement) reputation-weight))))
+    (map-set user-reputation skill-holder (- (get-user-reputation skill-holder) reputation-weight))
+    (ok true)))
+
+(define-read-only (get-skill-reputation-score (skill-name (string-ascii 50)) (skill-holder principal))
+  (let ((endorsements (get-skill-endorsements skill-name skill-holder)))
+    (if (> (get endorsement-count endorsements) u0)
+      (/ (get total-reputation endorsements) (get endorsement-count endorsements))
+      u0)))
+
+(define-read-only (get-top-endorsed-skills (skill-holder principal))
+  (let ((user-skill-list (get-user-skills skill-holder)))
+    (map get-skill-score user-skill-list)))
+
+(define-private (get-skill-score (skill-name (string-ascii 50)))
+  (tuple (skill-name skill-name) (score (get-skill-reputation-score skill-name tx-sender))))

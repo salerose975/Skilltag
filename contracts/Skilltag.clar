@@ -17,6 +17,16 @@
 (define-constant err-endorsement-not-found (err u112))
 (define-constant err-endorsement-expired (err u113))
 (define-constant err-insufficient-reputation (err u114))
+(define-constant err-assessment-not-found (err u115))
+(define-constant err-assessment-expired (err u116))
+(define-constant err-invalid-assessment-type (err u117))
+(define-constant err-assessment-already-exists (err u118))
+(define-constant err-unauthorized-assessor (err u119))
+(define-constant err-assessment-not-passed (err u120))
+(define-constant err-invalid-difficulty (err u121))
+(define-constant err-challenge-not-found (err u122))
+(define-constant err-challenge-expired (err u123))
+(define-constant err-invalid-response (err u124))
 
 (define-data-var last-token-id uint u0)
 (define-data-var commission uint u250)
@@ -47,6 +57,44 @@
   (tuple (reputation-weight uint) (endorsed-at uint) (expiry-block uint)))
 
 (define-map user-reputation principal uint)
+
+(define-map skill-assessments (tuple (skill-name (string-ascii 50)) (assessor principal))
+  (tuple 
+    (assessment-type (string-ascii 20))
+    (difficulty-level uint)
+    (max-score uint)
+    (passing-score uint)
+    (time-limit uint)
+    (created-at uint)
+    (expiry-block uint)
+    (is-active bool)))
+
+(define-map assessment-attempts (tuple (skill-name (string-ascii 50)) (participant principal) (assessor principal))
+  (tuple 
+    (score uint)
+    (max-possible-score uint)
+    (completion-time uint)
+    (attempted-at uint)
+    (is-passed bool)
+    (verification-hash (string-ascii 64))))
+
+(define-map skill-challenges (tuple (challenge-id uint) (skill-name (string-ascii 50)))
+  (tuple 
+    (challenger principal)
+    (challenged-user principal)
+    (challenge-type (string-ascii 20))
+    (challenge-data (string-ascii 200))
+    (expected-response-hash (string-ascii 64))
+    (created-at uint)
+    (expiry-block uint)
+    (is-completed bool)
+    (is-passed bool)))
+
+(define-map authorized-assessors (tuple (assessor principal) (skill-name (string-ascii 50))) bool)
+
+(define-map assessment-scores principal (list 20 (tuple (skill-name (string-ascii 50)) (score uint) (max-score uint))))
+
+(define-data-var last-challenge-id uint u0)
 
 (define-read-only (get-last-token-id)
   (ok (var-get last-token-id)))
@@ -284,3 +332,171 @@
 
 (define-private (get-skill-score (skill-name (string-ascii 50)))
   (tuple (skill-name skill-name) (score (get-skill-reputation-score skill-name tx-sender))))
+
+(define-read-only (get-skill-assessment (skill-name (string-ascii 50)) (assessor principal))
+  (map-get? skill-assessments (tuple (skill-name skill-name) (assessor assessor))))
+
+(define-read-only (get-assessment-attempt (skill-name (string-ascii 50)) (participant principal) (assessor principal))
+  (map-get? assessment-attempts (tuple (skill-name skill-name) (participant participant) (assessor assessor))))
+
+(define-read-only (get-skill-challenge (challenge-id uint) (skill-name (string-ascii 50)))
+  (map-get? skill-challenges (tuple (challenge-id challenge-id) (skill-name skill-name))))
+
+(define-read-only (is-authorized-assessor (assessor principal) (skill-name (string-ascii 50)))
+  (default-to false (map-get? authorized-assessors (tuple (assessor assessor) (skill-name skill-name)))))
+
+(define-read-only (get-user-assessment-scores (user principal))
+  (default-to (list) (map-get? assessment-scores user)))
+
+(define-read-only (calculate-skill-proficiency (skill-name (string-ascii 50)) (user principal))
+  (let ((user-scores (get-user-assessment-scores user))
+        (skill-score-data (filter is-skill-match user-scores)))
+    (if (> (len skill-score-data) u0)
+      (let ((skill-data (unwrap-panic (element-at skill-score-data u0))))
+        (/ (* (get score skill-data) u100) (get max-score skill-data)))
+      u0)))
+
+(define-private (is-skill-match (score-data (tuple (skill-name (string-ascii 50)) (score uint) (max-score uint))))
+  (is-eq (get skill-name score-data) "temp"))
+
+(define-read-only (get-challenge-verification-data (challenge-id uint) (skill-name (string-ascii 50)))
+  (let ((challenge-data (get-skill-challenge challenge-id skill-name)))
+    (match challenge-data
+      challenge (tuple 
+        (is-active (< stacks-block-height (get expiry-block challenge)))
+        (is-completed (get is-completed challenge))
+        (is-passed (get is-passed challenge)))
+      (tuple (is-active false) (is-completed false) (is-passed false)))))
+
+(define-public (authorize-skill-assessor (assessor principal) (skill-name (string-ascii 50)))
+  (begin
+    (asserts! (or (is-eq tx-sender contract-owner) (is-authorized-issuer tx-sender)) err-unauthorized-assessor)
+    (ok (map-set authorized-assessors (tuple (assessor assessor) (skill-name skill-name)) true))))
+
+(define-public (revoke-skill-assessor (assessor principal) (skill-name (string-ascii 50)))
+  (begin
+    (asserts! (or (is-eq tx-sender contract-owner) (is-authorized-issuer tx-sender)) err-unauthorized-assessor)
+    (ok (map-delete authorized-assessors (tuple (assessor assessor) (skill-name skill-name))))))
+
+(define-public (create-skill-assessment 
+  (skill-name (string-ascii 50))
+  (assessment-type (string-ascii 20))
+  (difficulty-level uint)
+  (max-score uint)
+  (passing-score uint)
+  (time-limit uint)
+  (validity-blocks uint))
+  (let ((assessor tx-sender)
+        (assessment-key (tuple (skill-name skill-name) (assessor assessor)))
+        (expiry-block (+ stacks-block-height validity-blocks)))
+    (asserts! (is-authorized-assessor assessor skill-name) err-unauthorized-assessor)
+    (asserts! (or 
+      (is-eq assessment-type "Multiple-Choice")
+      (is-eq assessment-type "Practical")
+      (is-eq assessment-type "Code-Review")
+      (is-eq assessment-type "Portfolio")) err-invalid-assessment-type)
+    (asserts! (and (>= difficulty-level u1) (<= difficulty-level u5)) err-invalid-difficulty)
+    (asserts! (> passing-score u0) err-invalid-assessment-type)
+    (asserts! (<= passing-score max-score) err-invalid-assessment-type)
+    (asserts! (is-none (get-skill-assessment skill-name assessor)) err-assessment-already-exists)
+    (map-set skill-assessments assessment-key
+      (tuple 
+        (assessment-type assessment-type)
+        (difficulty-level difficulty-level)
+        (max-score max-score)
+        (passing-score passing-score)
+        (time-limit time-limit)
+        (created-at stacks-block-height)
+        (expiry-block expiry-block)
+        (is-active true)))
+    (ok assessment-key)))
+
+(define-public (take-skill-assessment 
+  (skill-name (string-ascii 50))
+  (assessor principal)
+  (score uint)
+  (completion-time uint)
+  (verification-hash (string-ascii 64)))
+  (let ((participant tx-sender)
+        (assessment-key (tuple (skill-name skill-name) (assessor assessor)))
+        (attempt-key (tuple (skill-name skill-name) (participant participant) (assessor assessor)))
+        (assessment-data (unwrap! (get-skill-assessment skill-name assessor) err-assessment-not-found)))
+    (asserts! (get is-active assessment-data) err-assessment-expired)
+    (asserts! (< stacks-block-height (get expiry-block assessment-data)) err-assessment-expired)
+    (asserts! (<= score (get max-score assessment-data)) err-invalid-response)
+    (asserts! (<= completion-time (get time-limit assessment-data)) err-invalid-response)
+    (let ((is-passed (>= score (get passing-score assessment-data)))
+          (user-scores (get-user-assessment-scores participant))
+          (new-score-entry (tuple (skill-name skill-name) (score score) (max-score (get max-score assessment-data))))
+          (updated-scores (unwrap! (as-max-len? (append user-scores new-score-entry) u20) err-assessment-already-exists)))
+      (map-set assessment-attempts attempt-key
+        (tuple 
+          (score score)
+          (max-possible-score (get max-score assessment-data))
+          (completion-time completion-time)
+          (attempted-at stacks-block-height)
+          (is-passed is-passed)
+          (verification-hash verification-hash)))
+      (if is-passed
+        (map-set assessment-scores participant updated-scores)
+        true)
+      (ok is-passed))))
+
+(define-public (create-skill-challenge 
+  (challenged-user principal)
+  (skill-name (string-ascii 50))
+  (challenge-type (string-ascii 20))
+  (challenge-data (string-ascii 200))
+  (expected-response-hash (string-ascii 64))
+  (validity-blocks uint))
+  (let ((challenger tx-sender)
+        (challenge-id (+ (var-get last-challenge-id) u1))
+        (challenge-key (tuple (challenge-id challenge-id) (skill-name skill-name)))
+        (expiry-block (+ stacks-block-height validity-blocks)))
+    (asserts! (not (is-eq challenger challenged-user)) err-cannot-endorse-self)
+    (asserts! (is-some (index-of (get-user-skills challenged-user) skill-name)) err-nft-not-found)
+    (asserts! (or 
+      (is-eq challenge-type "Knowledge-Test")
+      (is-eq challenge-type "Problem-Solving")
+      (is-eq challenge-type "Code-Debug")
+      (is-eq challenge-type "Design-Review")) err-invalid-assessment-type)
+    (map-set skill-challenges challenge-key
+      (tuple 
+        (challenger challenger)
+        (challenged-user challenged-user)
+        (challenge-type challenge-type)
+        (challenge-data challenge-data)
+        (expected-response-hash expected-response-hash)
+        (created-at stacks-block-height)
+        (expiry-block expiry-block)
+        (is-completed false)
+        (is-passed false)))
+    (var-set last-challenge-id challenge-id)
+    (ok challenge-id)))
+
+(define-public (respond-to-skill-challenge 
+  (challenge-id uint)
+  (skill-name (string-ascii 50))
+  (response-hash (string-ascii 64)))
+  (let ((challenge-key (tuple (challenge-id challenge-id) (skill-name skill-name)))
+        (challenge-data (unwrap! (get-skill-challenge challenge-id skill-name) err-challenge-not-found)))
+    (asserts! (is-eq tx-sender (get challenged-user challenge-data)) err-unauthorized-assessor)
+    (asserts! (< stacks-block-height (get expiry-block challenge-data)) err-challenge-expired)
+    (asserts! (not (get is-completed challenge-data)) err-challenge-expired)
+    (let ((is-correct (is-eq response-hash (get expected-response-hash challenge-data))))
+      (map-set skill-challenges challenge-key
+        (merge challenge-data (tuple (is-completed true) (is-passed is-correct))))
+      (if is-correct
+        (map-set user-reputation (get challenged-user challenge-data) 
+          (+ (get-user-reputation (get challenged-user challenge-data)) u5))
+        true)
+      (ok is-correct))))
+
+(define-public (verify-skill-challenge-completion (challenge-id uint) (skill-name (string-ascii 50)))
+  (let ((challenge-key (tuple (challenge-id challenge-id) (skill-name skill-name)))
+        (challenge-data (unwrap! (get-skill-challenge challenge-id skill-name) err-challenge-not-found)))
+    (asserts! (get is-completed challenge-data) err-challenge-not-found)
+    (ok (get is-passed challenge-data))))
+
+
+

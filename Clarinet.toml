@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/Skilltag.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.skills-learning-path]
+path = 'contracts/skills-learning-path.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 

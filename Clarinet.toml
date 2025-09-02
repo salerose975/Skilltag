@@ -1,0 +1,25 @@
+[project]
+name = 'Skilltag'
+description = ''
+authors = []
+telemetry = true
+cache_dir = '.\.cache'
+requirements = []
+
+[contracts.skills-learning-path]
+path = 'contracts/skills-learning-path.clar'
+clarity_version = 3
+epoch = 3.1
+
+[contracts.Skilltag]
+path = 'contracts/Skilltag.clar'
+clarity_version = 3
+epoch = 3.1
+[repl.analysis]
+passes = ['check_checker']
+
+[repl.analysis.check_checker]
+strict = false
+trusted_sender = false
+trusted_caller = false
+callee_filter = false
